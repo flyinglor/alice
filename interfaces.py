@@ -99,6 +99,38 @@ def get_embedding(model, im, im_info, cfg):
         result = dict(coarse_emb=result[1], fine_emb=result[0], im_norm_ratio=im_norm_ratio, im_shape=im.shape)
     return result
 
+def get_batch_embedding(model, image, cfg):
+    # Create Collect3d instance
+    im_shape = image.shape
+    im_norm_ratio = np.array(cfg.norm_spacing) / np.array(cfg.norm_spacing)
+    image = image.reshape(1, 1, 128, 128, 128)
+    collects = Collect3d(keys=['img'], meta_keys=[])
+    data = {}
+    data['img'] = image
+    input = collects(data)
+    batched_data = collate([input])
+    batched_data['img'] = [img.contiguous() for img in list(batched_data['img'])]
+
+    # # Prepare data for each image in the batch
+    # processed_batch = []
+    # for img in images:
+    #     data = {}
+    #     data['img'] = img  # Assign the individual image
+    #     processed_data = collects(data)  # Apply Collect3D
+    #     processed_batch.append(processed_data)  # Store the processed result
+
+    # # Collate the batch
+    # batched_data = collate(processed_batch)
+
+    with torch.no_grad():
+        result = model(return_loss=False, rescale=True, **batched_data)
+    if 'semantic' in cfg:
+        result = dict(coarse_emb=result[1], fine_emb=result[0], sem_emb=result[2], im_norm_ratio=im_norm_ratio,
+                      im_shape=im_shape)
+    else:
+        result = dict(coarse_emb=result[1], fine_emb=result[0], im_norm_ratio=im_norm_ratio, im_shape=im_shape)
+    return result
+
 
 def find_point_in_vol(query_data, key_data, query_points, cfg):
     if 'semantic' in cfg:
@@ -110,14 +142,15 @@ def find_point_in_vol(query_data, key_data, query_points, cfg):
 
 
 def extract_point_emb(query_data, query_points, cfg):
-    im_norm_ratio, _ = read_info(query_data[3])
+    # im_norm_ratio, _ = read_info(query_data[3]) #TODO 
+    im_norm_ratio = query_data['im_norm_ratio']
     #query_points = np.array(query_points) * query_data['im_norm_ratio']
     query_points = np.array(query_points) * im_norm_ratio
     query_points = np.floor(query_points / cfg.local_emb_stride).astype(int)
-    #coarse_query_vol = query_data['coarse_emb']
-    coarse_query_vol = query_data[1]
-    #fine_query_vol = query_data['fine_emb']
-    fine_query_vol = query_data[0]
+    coarse_query_vol = query_data['coarse_emb']
+    # coarse_query_vol = query_data[1]
+    fine_query_vol = query_data['fine_emb']
+    # fine_query_vol = query_data[0]
     coarse_query_vol = F.interpolate(coarse_query_vol, fine_query_vol.shape[2:], mode='trilinear')
     coarse_query_vol = F.normalize(coarse_query_vol, dim=1)
     if 'semantic' in cfg:
@@ -156,8 +189,8 @@ def extract_point_emb(query_data, query_points, cfg):
 
 
 def match_vec_in_vol(coarse_query_vec, fine_query_vec, key_data, cfg, sem_query_vec=None):
-    #coarse_key_vol, fine_key_vol = key_data['coarse_emb'], key_data['fine_emb']
-    coarse_key_vol, fine_key_vol = key_data[1], key_data[0]
+    coarse_key_vol, fine_key_vol = key_data['coarse_emb'], key_data['fine_emb']
+    # coarse_key_vol, fine_key_vol = key_data[1], key_data[0]
     sem_key_vol = key_data['sem_emb'] if not sem_query_vec is None else None
 
     # is it correct to interpolate embeddings? Will it mix neighboring pixels?
@@ -198,10 +231,12 @@ def match_vec_in_vol_single(coarse_key_vol, fine_key_vol, coarse_query_vec, fine
     ind = torch.argmax(sim, dim=1).cpu().numpy()
     zyx = np.unravel_index(ind, fine_key_vol.shape[2:])
     xyz = np.vstack(zyx)[::-1] * cfg.local_emb_stride + .5  # add .5 to closer to stride center
-    im_norm_ratio, _ = read_info(key_data[3])
+    # im_norm_ratio, _ = read_info(key_data[3])
+    im_norm_ratio = key_data['im_norm_ratio']
     #xyz = xyz.T / key_data['im_norm_ratio']
     xyz = xyz.T / im_norm_ratio
-    _, im_shape = read_info(key_data[3])
+    im_shape = key_data['im_shape']
+    # _, im_shape = read_info(key_data[3])
     #xyz = np.minimum(np.round(xyz.astype(int)), np.array(key_data['im_shape'])[::-1] - 1)
     xyz = np.minimum(np.round(xyz.astype(int)), im_shape[1:])
 

@@ -15,7 +15,9 @@ import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 from tqdm import tqdm
 from models.nnFormer import nnFormer
-from interfaces import init_model, get_embedding, find_point_in_vol
+from interfaces import init_model, get_embedding, get_batch_embedding, find_point_in_vol
+from sam.datasets.pipelines import Collect3d
+from sam.datasets.collect import collate
 import pickle
 
 from pathlib import Path
@@ -25,23 +27,15 @@ from torchvision import models as torchvision_models
 from tensorboardX import SummaryWriter
 
 from models.head import AliceHead
-from loader import get_loader, get_loader_adni_ukb
+from loader import get_loader
 from loss import Loss
 from CASA import CASA_Module
-from engine_pretrain import train_one_epoch
-from validation import validation
+from loader import get_loader, get_loader_adni_ukb
+
 #Dp
 from torch.multiprocessing import Process
 import torch.utils.data.distributed
 import torch.distributed as dist
-import wandb
-
-
-# from evaluation.unsupervised.unsup_cls import eval_pred
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.benchmark = True
-torch.backends.cudnn.deterministic = False
-torch.backends.cudnn.allow_tf32 = True
 
 
 def get_args_parser():
@@ -97,7 +91,7 @@ def get_args_parser():
         loss over [CLS] tokens (Default: 1.0)""")
     parser.add_argument('--lambda2', default=1.0, type=float, help="""loss weight for contrastive 
         loss over patch token embeddings (Default: 1.0)""")
-    parser.add_argument('--lambda3', default=1.0, type=float, help="""loss weight for MAE 
+    parser.add_argument('--lambda3', default=10, type=float, help="""loss weight for MAE 
         loss over masked patch tokens (Default: 1.0)""")       
     # Temperature teacher parameters
     parser.add_argument('--warmup_teacher_temp', default=0.008, type=float,
@@ -159,10 +153,10 @@ def get_args_parser():
     parser.add_argument('--sw_batch_size', default=2, type=int, help='number of sliding window batch size')
     parser.add_argument('--normal_dataset', default=False, action='store_true', help='use monai Dataset class')
     parser.add_argument('--smartcache_dataset', default=False, action='store_true', help='use monai smartcache Dataset class')
-    parser.add_argument('--adni_dataset', default=False, action='store_true', help='use adni Dataset class')
+    parser.add_argument('--adni_dataset', default=True, action='store_true', help='use adni Dataset class')
     parser.add_argument('--ukb_dataset', default=False, action='store_true', help='use ukb Dataset class')
 
-    parser.add_argument('--distributed', action='store_true', default=True, help='enable distributed training')
+    parser.add_argument('--distributed', action='store_true', default=False, help='enable distributed training')
     parser.add_argument("--threshold", type=float, default=0.6, help="""We visualize masks
         obtained by thresholding the self-attention maps to keep xx% of the mass.""")
     parser.add_argument('--mask_ratio', default=0.75, help='mask ratio')
@@ -189,252 +183,51 @@ def get_args_parser():
     
     return parser
 
-def train_Alice(args):
-    utils.init_distributed_mode(args)
-    # utils.fix_random_seeds(args.seed)
-    
-    # ============ preparing data ... ============
-    pred_size = args.patch_size * 8 if 'swin' in args.arch else args.patch_size
-    # data_loader, test_loader = get_loader(args)
-    data_loader, test_loader = get_loader_adni_ukb(args)
+if __name__ == '__main__':
 
-    print(f"Data loaded: there are {len(data_loader)} images.")
+    parser = argparse.ArgumentParser('Alice', parents=[get_args_parser()])
+    args = parser.parse_args()
+    #dataloader or single image?
+    data_loader, test_loader = get_loader_adni_ukb(args, test=True)
 
-    # ============ building student and teacher networks ... ============
-    student = nnFormer(
-              img_size=(args.roi_x, args.roi_y, args.roi_z),
-              input_channels=args.in_channels,
-              output_channels=args.out_channels,
-              embedding_dim=args.feature_size,
-              )
-    teacher = nnFormer(
-              img_size=(args.roi_x, args.roi_y, args.roi_z),
-              input_channels=args.in_channels,
-              output_channels=args.out_channels,
-              embedding_dim=args.feature_size,
-              )
-    embed_dim = args.feature_size * (2 ** 3)
-    
-    casa_module = CASA_Module.CASA(args.out_dim, 2048, 8, 64, 64).cuda()
-    casa_module = nn.parallel.DistributedDataParallel(casa_module, device_ids=[args.gpu], broadcast_buffers=False, find_unused_parameters=True)
-    
-    # multi-crop wrapper handles forward with inputs of different resolutions
-    student = utils.MultiCropWrapper(
-        student, 
-        AliceHead(
-            embed_dim,
-            args.out_dim,
-            patch_out_dim=args.patch_out_dim,
-            norm=args.norm_in_head,
-            act=args.act_in_head,
-            norm_last_layer=args.norm_last_layer,
-            shared_head=args.shared_head,
-        ),
-    )
-    teacher = utils.MultiCropWrapper(
-        teacher,
-        AliceHead(
-            embed_dim, 
-            args.out_dim,
-            patch_out_dim=args.patch_out_dim,
-            norm=args.norm_in_head,
-            act=args.act_in_head,
-            shared_head=args.shared_head_teacher,
-        ),
-    )
-    # move networks to gpu
-    student, teacher = student.cuda(), teacher.cuda()
-    # synchronize batch norms (if any)
-    if utils.has_batchnorms(student):
-        student = nn.SyncBatchNorm.convert_sync_batchnorm(student)
-        teacher = nn.SyncBatchNorm.convert_sync_batchnorm(teacher)
-
-        # we need DDP wrapper to have synchro batch norms working...
-        teacher = nn.parallel.DistributedDataParallel(teacher, device_ids=[args.gpu], broadcast_buffers=False, find_unused_parameters=True) if \
-            'nnformer' in args.arch else nn.parallel.DistributedDataParallel(teacher, device_ids=[args.gpu], find_unused_parameters=True)
-        teacher_without_ddp = teacher.module
-    else:
-        # teacher_without_ddp and teacher are the same thing
-        teacher_without_ddp = teacher
-    student = nn.parallel.DistributedDataParallel(student, device_ids=[args.gpu], broadcast_buffers=False, find_unused_parameters=True) if \
-        'nnformer' in args.arch else nn.parallel.DistributedDataParallel(student, device_ids=[args.gpu], find_unused_parameters=True)
-    # teacher and student start with the same weights
-    teacher_without_ddp.load_state_dict(student.module.state_dict(), strict=False)
-
-    # there is no backpropagation through the teacher, so no need for gradients
-    for p in teacher.parameters():
-        p.requires_grad = False
-    print(f"Student and Teacher are built: they are both {args.arch} network.")
-    
-    
     # ============ building SAM model ... ============    
     sam_model, sam_cfg = init_model(args.config_file, args.checkpoint_file)
 
-    # ============ preparing loss ... ============
-    same_dim = args.shared_head or args.shared_head_teacher
-    alice_loss = Loss(
-        args.out_dim,
-        args.out_dim if same_dim else args.patch_out_dim,
-        args.global_crops_number,
-        args.warmup_teacher_temp,
-        args.teacher_temp,
-        args.warmup_teacher_patch_temp,
-        args.teacher_patch_temp,
-        args.warmup_teacher_temp_epochs,
-        args.epochs,
-        lambda1=args.lambda1,
-        lambda2=args.lambda2,
-        lambda3=args.lambda3,
-        mim_start_epoch=args.pred_start_epoch,
-    ).cuda()
-
-    if utils.is_main_process(): # Tensorboard configuration
-        local_runs = os.path.join(args.output_dir, 'tf_logs')
-        writer = SummaryWriter(logdir=local_runs)
+    for it, batch in enumerate(data_loader):
+        image = batch['img']
+        memory_queue_patch = batch
         
-    # ============ preparing optimizer ... ============
-    # params_groups = utils.get_params_groups(student)
-    params_groups = utils.get_params_groups_dual(student, casa_module)
-    
-    if args.optimizer == "adamw":
-        optimizer = torch.optim.AdamW(params_groups)  # to use with ViTs
-    elif args.optimizer == "sgd":
-        optimizer = torch.optim.SGD(params_groups, lr=0, momentum=0.9)  # lr is set by scheduler
-    elif args.optimizer == "lars":
-        optimizer = utils.LARS(params_groups)  # to use with convnet and large batches
-    # for mixed precision training
-    fp16_scaler = None
-    if args.use_fp16:
-        fp16_scaler = torch.cuda.amp.GradScaler()
+        memory_image = memory_queue_patch['img']
 
-    # ============ init schedulers ... ============
-    lr_schedule = utils.cosine_scheduler(
-        args.lr, #* (args.batch_size * utils.get_world_size()) / 256.,  # linear scaling rule
-        args.min_lr,
-        args.epochs, 
-        len(data_loader),
-        warmup_epochs=args.warmup_epochs,
-    )
-    wd_schedule = utils.cosine_scheduler(
-        args.weight_decay, 
-        args.weight_decay_end,
-        args.epochs, 
-        len(data_loader),
-    )
-    # momentum parameter is increased to 1. during training with a cosine schedule
-    momentum_schedule = utils.cosine_scheduler(args.momentum_teacher, 1,
-                                            args.epochs, len(data_loader))
-                  
-    print(f"Loss, optimizer and schedulers ready.")
+        norm_info_1 = np.array(sam_cfg.norm_spacing) / np.array(sam_cfg.norm_spacing)
+        norm_info_2 = norm_info_1
 
-    # ============ optionally resume training ... ============
-    to_restore = {"epoch": 0}
-    if args.load_from:
-        utils.restart_from_checkpoint(
-            os.path.join(args.output_dir, args.load_from),
-            run_variables=to_restore,
-            student=student,
-            teacher=teacher,
-            optimizer=optimizer,
-            fp16_scaler=fp16_scaler,
-            alice_loss=alice_loss,
-        )
-    start_epoch = to_restore["epoch"]
+        #get the embeddings from pretrained sam model
+        emb1 = get_batch_embedding(sam_model, image[0], sam_cfg)
+        emb2 = get_batch_embedding(sam_model, memory_image[1], sam_cfg)
 
-    start_time = time.time()
-    print("Starting training Alice!")
-    
-    best_val = 1e8
-    global memory_queue_patch
-    memory_queue_patch = 0
-    
-    iters = start_epoch*len(data_loader)
-    for epoch in range(start_epoch, args.epochs):
-        data_loader.sampler.set_epoch(epoch)
-        # data_loader.dataset.set_epoch(epoch)
+        iter_points, scores = 0, 0
+        while iter_points<=100 and scores<=0.7:
+            pts = utils.select_random_points(2, image.transpose(2, 4))
+            pts1, pts2 = pts[0], pts[1]
+            pts1_pred, scores = find_point_in_vol(emb1, emb2, [pts1], sam_cfg)
+            iter_points += 1
+        # pts1_pred = pts1_pred[0]
 
-        # ============ training one epoch of Alice ... ============
-        train_stats, iters = train_one_epoch(student, teacher, teacher_without_ddp, alice_loss,
-            data_loader, optimizer, lr_schedule, wd_schedule, momentum_schedule,
-            epoch, fp16_scaler, sam_cfg, casa_module, sam_model, iters, args)
+        # # to save
+        utils.visualize(image[0].squeeze(0).numpy(), memory_image[0].squeeze(0).numpy(), norm_info_1, norm_info_2, pts1, pts1_pred, scores, "./results/images/")
+        # not save
+        # utils.visualize(image[0].squeeze(0).numpy(), memory_image[0].squeeze(0).numpy(), norm_info_1, norm_info_2, pts1, pts1_pred, scores)
 
-        # ============ writing logs ... ============
-        save_dict = {
-            'student': student.state_dict(),
-            'teacher': teacher.state_dict(),
-            'optimizer': optimizer.state_dict(),
-            'epoch': epoch + 1,
-            'args': args,
-            'alice_loss': alice_loss.state_dict(),
-        }
-        
-        if args.eval_epoch and (epoch % args.eval_epoch == 0):
-            val_stats = validation(args, student, teacher, alice_loss, test_loader, epoch, sam_model, sam_cfg, casa_module)
-            
-            if not args.disable_wandb: 
-                wandb.log(
-                    {
-                    "validation - total Loss": val_stats['val_loss'],
-                    "validation - recon loss": val_stats['val_recon'],
-                    "validation - cls loss": val_stats['val_cls'],
-                    "validation - patch loss": val_stats['val_patch'],
-                    },
-                    step=iters,
-                )
+        pts1_pred = pts1_pred[0]
+        query =  utils.crop_tensor_new(image, pts1, args.roi_x, args.roi_y, args.roi_z)
+        # print(query.shape) # torch.Size([16, 1, 64, 64, 64])
+        anchor = utils.crop_tensor_new(memory_image, pts1_pred, args.roi_x, args.roi_y, args.roi_z)
+        # print(anchor.shape) # torch.Size([16, 1, 64, 64, 64])
 
-            log_val_stats = {**{f'{k}': v for k, v in val_stats.items()},
-                     'epoch': epoch}
-            if utils.is_main_process():
-                with (Path(args.output_dir) / "log_val.txt").open("a") as f:
-                    f.write(json.dumps(log_val_stats) + "\n")
-                    for k, v in val_stats.items():
-                        writer.add_scalar(k, v, epoch)
+        utils.visualize_crop(query[0].squeeze(0), anchor[1].squeeze(0), "./results/images/")
 
-            if val_stats['val_loss'] < best_val:
-                best_val = val_stats['val_loss']
-                utils.save_on_master(save_dict, os.path.join(args.output_dir, f'checkpoint_bestval.pth'))
-                print('Model was saved ! Best Val Loss: {}'.format(best_val))
-            else:
-                print('Model was not saved ! Best Val Loss: {}'.format(best_val))
-        
-        if fp16_scaler is not None:
-            save_dict['fp16_scaler'] = fp16_scaler.state_dict()
-        utils.save_on_master(save_dict, os.path.join(args.output_dir, 'checkpoint.pth'))
-        if args.saveckp_freq and (epoch % args.saveckp_freq == 0) and epoch:
-            utils.save_on_master(save_dict, os.path.join(args.output_dir, f'checkpoint{epoch:04}.pth'))
-        
-        log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                     'epoch': epoch}
-        if utils.is_main_process():
-            with (Path(args.output_dir) / "log.txt").open("a") as f:
-                f.write(json.dumps(log_stats) + "\n")
-                for k, v in train_stats.items():
-                    writer.add_scalar(k, v, epoch)
-        
-    total_time = time.time() - start_time
-    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print('Training time {}'.format(total_time_str))
-     
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser('Alice', parents=[get_args_parser()])
-    args = parser.parse_args()
-
-    if not args.disable_wandb:
-        if args.load_from:
-            wandb_id = "1e831c0g"
-        else:   
-            wandb_id = wandb.util.generate_id()
-        
-        ds = "adni" if args.adni_dataset else "ukb"
-        run = wandb.init(project=f"alice_{ds}", 
-                        name=f"{args.arch}_bs{args.batch_size}_ep{args.epochs}_lr{args.lr}_{args.roi_x}^3", 
-                        id=wandb_id,
-                        resume='allow',
-                        dir=args.output_dir)
-
-    torch.cuda.set_device(args.local_rank)
-    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    train_Alice(args)
-
-    if args.local_rank == 0 and not args.disable_wandb:
-        run.finish()
+        # query_aug, anchor_aug= utils.data_aug(args, query), utils.data_aug(args, anchor)
+        # images_normal = [query, anchor]
+        # images_aug = [query_aug, anchor_aug]
+        # masks = utils.random_mask(args, images_normal)

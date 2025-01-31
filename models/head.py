@@ -3,6 +3,7 @@ import torch.nn as nn
 import utils
 
 from utils import trunc_normal_
+import torch.nn.functional as F
 
 class CSyncBatchNorm(nn.SyncBatchNorm):
     def __init__(self,
@@ -143,7 +144,7 @@ class AliceHead(DINOHead):
                  nlayers=3, hidden_dim=2048, bottleneck_dim=256, norm_last_layer=True, 
                  shared_head=False, **kwargs):
         
-        super(Att_iBOTHead, self).__init__(*args,
+        super(AliceHead, self).__init__(*args,
                                         norm=norm,
                                         act=act,
                                         last_norm=last_norm,
@@ -206,4 +207,86 @@ class AliceHead(DINOHead):
             x3 = self.last_norm2(x3)
         
         return x1, x2, x3    
-    
+
+class ClassificationHead2FC(nn.Module):
+    def __init__(self, input_dim, num_classes=3, cls=False):
+        super(ClassificationHead2FC, self).__init__()
+        self.linear1 = nn.Linear(input_dim, input_dim)
+        self.ln1 = nn.LayerNorm(input_dim, eps=1e-6)
+        self.relu1 = nn.ReLU()
+        
+        self.avg_pool = nn.AvgPool1d(kernel_size=8, stride=1)
+        self.fc = nn.Linear(input_dim, num_classes)
+
+        self.cls = cls
+
+    def forward(self, x):
+        x = self.linear1(x)  # [batch_size, seq_len, hidden_dim] torch.Size([8, 8, 512])
+        x = self.ln1(x)  # [batch_size, seq_len, hidden_dim]
+        x = self.relu1(x)  # [batch_size, seq_len, hidden_dim]
+
+        if not self.cls:
+            x = x.transpose(1, 2)  # [batch_size, hidden_dim, seq_len]
+            x = self.avg_pool(x)  # [batch_size, hidden_dim, 1]  
+            # Remove the singleton dimension: [batch_size, hidden_dim]
+            x = x.squeeze(-1)
+            
+        x = self.fc(x)  # [batch_size, output_dim]
+        return F.softmax(x, dim=1)
+
+class ClassificationHead3FC(nn.Module):
+    def __init__(self, input_dim, num_classes=3, cls=False):
+        super(ClassificationHead3FC, self).__init__()
+        self.linear1 = nn.Linear(input_dim, 256)  # Reduce from 512 to 256
+        self.ln1 = nn.LayerNorm(256, eps=1e-6)
+        self.relu1 = nn.ReLU()
+
+        self.linear2 = nn.Linear(256, 256)  # Retain dimensionality at 256
+        self.ln2 = nn.LayerNorm(256, eps=1e-6)
+        self.relu2 = nn.ReLU()
+
+        self.linear3 = nn.Linear(256, num_classes)  # Final output layer
+
+        self.cls = cls
+
+    def forward(self, x):
+        x = self.linear1(x)  # [batch_size, seq_len, 256]
+        x = self.ln1(x)  # [batch_size, seq_len, 256]
+        x = self.relu1(x)  # [batch_size, seq_len, 256]
+
+        x = self.linear2(x)  # [batch_size, seq_len, 256]
+        x = self.ln2(x)  # [batch_size, seq_len, 256]
+        x = self.relu2(x)  # [batch_size, seq_len, 256]
+
+        if not self.cls:
+            x = x.transpose(1, 2)  # [batch_size, hidden_dim, seq_len]
+            x = nn.AvgPool1d(kernel_size=x.shape[-1])(x)  # Global AvgPool
+            x = x.squeeze(-1)  # [batch_size, hidden_dim]
+
+        x = self.linear3(x)  # [batch_size, num_classes]
+        return F.softmax(x, dim=1)
+
+class ClassificationHeadCLS(nn.Module):
+    def __init__(self, input_dim, num_classes=3):
+        super(ClassificationHeadCLS, self).__init__()
+        self.linear1 = nn.Linear(input_dim, 256)  # Reduce from 512 to 256
+        self.ln1 = nn.LayerNorm(256, eps=1e-6)
+        self.relu1 = nn.ReLU()
+
+        self.linear2 = nn.Linear(256, 256)  # Retain dimensionality at 256
+        self.ln2 = nn.LayerNorm(256, eps=1e-6)
+        self.relu2 = nn.ReLU()
+
+        self.linear3 = nn.Linear(256, num_classes)  # Final output layer
+
+    def forward(self, x):
+        x = self.linear1(x)  # [batch_size, seq_len, 256]
+        x = self.ln1(x)  # [batch_size, seq_len, 256]
+        x = self.relu1(x)  # [batch_size, seq_len, 256]
+
+        x = self.linear2(x)  # [batch_size, seq_len, 256]
+        x = self.ln2(x)  # [batch_size, seq_len, 256]
+        x = self.relu2(x)  # [batch_size, seq_len, 256]
+
+        x = self.linear3(x)  # [batch_size, num_classes]
+        return F.softmax(x, dim=1)

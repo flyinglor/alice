@@ -15,7 +15,7 @@ import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 from tqdm import tqdm
 from models.nnFormer import nnFormer
-from interfaces import init_model, get_embedding, find_point_in_vol
+from interfaces import init_model, get_embedding, find_point_in_vol, get_batch_embedding
 
 from pathlib import Path
 from PIL import Image
@@ -34,7 +34,7 @@ import torch.utils.data.distributed
 import torch.distributed as dist
 
 
-def validation(args, student, teacher, alice_loss, test_loader, epoch, sam_cfg, CASA):
+def validation(args, student, teacher, alice_loss, test_loader, epoch, sam_model, sam_cfg, CASA):
     global memory_queue_patch
     
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -47,25 +47,28 @@ def validation(args, student, teacher, alice_loss, test_loader, epoch, sam_cfg, 
     with torch.no_grad():
         for it, batch in enumerate(test_loader):
             #image = batch['image'].cuda(non_blocking=True)
-            image = batch['image'].to(args.local_rank, non_blocking=True)
-            name1 = batch['name'][0]
+            image = batch['img'].to(args.local_rank, non_blocking=True)
+            # name1 = batch['name'][0]
             
-            emb_path_1 = args.embed_dir + 'Embeddings' + name1 + '.pkl'
-            with open(emb_path_1, 'rb') as file:
-                emb1 = pickle.load(file)
+            # emb_path_1 = args.embed_dir + 'Embeddings' + name1 + '.pkl'
+            # with open(emb_path_1, 'rb') as file:
+            #     emb1 = pickle.load(file)
             #emb1 = np.load(args.embed_dir+name1+'.npy', allow_pickle=True).item()
             
             #new_add
             #if epoch == 0:
             memory_queue_patch = batch
         
-            memory_image = memory_queue_patch['image']
-            name2 = memory_queue_patch['name'][0]
+            memory_image = memory_queue_patch['img']
+            # name2 = memory_queue_patch['name'][0]
             
-            emb_path_2 = args.embed_dir + 'Embeddings' + name2 + '.pkl'
-            with open(emb_path_2, 'rb') as file_2:
-                emb2 = pickle.load(file_2)
+            # emb_path_2 = args.embed_dir + 'Embeddings' + name2 + '.pkl'
+            # with open(emb_path_2, 'rb') as file_2:
+            #     emb2 = pickle.load(file_2)
             #emb2 = np.load(args.embed_dir+name2+'.npy', allow_pickle=True).item()
+
+            emb1 = get_batch_embedding(sam_model, image[0], sam_cfg)
+            emb2 = get_batch_embedding(sam_model, memory_image[0], sam_cfg)
         
             pts = utils.select_random_points(1, image.transpose(2, 4))
             pts1 = pts[0]

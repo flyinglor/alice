@@ -491,9 +491,10 @@ def init_distributed_mode(args):
         args.world_size = int(os.environ['WORLD_SIZE'])
         args.gpu = int(os.environ['LOCAL_RANK'])
     # launched with submitit on a slurm cluster
-    elif 'SLURM_PROCID' in os.environ:
-        args.rank = int(os.environ['SLURM_PROCID'])
-        args.gpu = args.rank % torch.cuda.device_count()
+    # elif 'SLURM_PROCID' in os.environ:
+    #     args.rank = int(os.environ['SLURM_PROCID'])
+    #     args.gpu = args.rank % torch.cuda.device_count()
+    #     args.world_size = int(os.environ['SLURM_JOB_NUM_NODES'])#'SLURM_JOB_NUM_NODES': '1'
     # launched naively with `python main_dino.py`
     # we manually add MASTER_ADDR and MASTER_PORT to env variables
     elif torch.cuda.is_available():
@@ -962,60 +963,75 @@ def windowing(im, win=[-200, 200]):
 
 def visualize(q_img, k_img, norm_ratio_1, norm_ratio_2, pt1, pts2, score, save_path=None):
     num_pred = len(score)
+    print(num_pred)
     fig, ax = plt.subplots(3, num_pred+1, figsize=(20, 30))
     slice = q_img[pt1[2], :, :]
-    ax[0, 0].set_title('query')
+    ax[0, 0].set_title('Query')
     ax[0, 0].imshow(slice, cmap='gray')
     ax[0, 0].plot((pt1[0]), (pt1[1]), 'o', markerfacecolor='none',
                   markeredgecolor="red",
-                  markersize=12, markeredgewidth=2)
+                  markersize=30, markeredgewidth=5)
+    ax[0, 0].axis('off')
     slice = q_img[:, pt1[1], :]
+
     slice = slice[::-1, :]
-    ax[1, 0].set_title('query')
+    ax[1, 0].set_title('Query')
     ax[1, 0].imshow(slice, cmap='gray', aspect=norm_ratio_1[2] / norm_ratio_1[0])
     ax[1, 0].plot((pt1[0]), (q_img.shape[0] - pt1[2] - 1), 'o',
                   markerfacecolor='none', markeredgecolor="red",
-                  markersize=12, markeredgewidth=2)
+                  markersize=30, markeredgewidth=5)
+    ax[1, 0].axis('off')
 
     slice = q_img[:, :, pt1[0]]
     slice = slice[::-1, :]
-    ax[2, 0].set_title('query')
+    ax[2, 0].set_title('Query')
     ax[2, 0].imshow(slice, cmap='gray', aspect=norm_ratio_1[2] / norm_ratio_1[1])
     ax[2, 0].plot((pt1[1]), (q_img.shape[0] - pt1[2] - 1), 'o',
                   markerfacecolor='none', markeredgecolor="red",
-                  markersize=12, markeredgewidth=2)
+                  markersize=30, markeredgewidth=5)
+    ax[2, 0].axis('off')
 
     for p in range(num_pred):
         slice = k_img[pts2[p, 2], :, :]
-        ax[0, p+1].set_title('key')
+        ax[0, p+1].set_title('Key')
         ax[0, p+1].imshow(slice, cmap='gray')
         ax[0, p+1].plot((pts2[p, 0]), (pts2[p, 1]), 'o', markerfacecolor='none',
                       markeredgecolor="red",
-                      markersize=12, markeredgewidth=2)
+                      markersize=30, markeredgewidth=5)
+        ax[0, p+1].axis('off')
     
         slice = k_img[:, pts2[p, 1], :]
         slice = slice[::-1, :]
     
-        ax[1, p+1].set_title('key')
+        ax[1, p+1].set_title('Key')
         ax[1, p+1].imshow(slice, cmap='gray', aspect=norm_ratio_2[2] / norm_ratio_2[0])
         ax[1, p+1].plot((pts2[p, 0]), (k_img.shape[0] - pts2[p, 2] - 1), 'o',
                       markerfacecolor='none',
                       markeredgecolor="red",
-                      markersize=12, markeredgewidth=2)
+                      markersize=30, markeredgewidth=5)
+        ax[1, p+1].axis('off')
+
         slice = k_img[:, :, pts2[p, 0]]
         slice = slice[::-1, :]
-        ax[2, p+1].set_title('key')
+        ax[2, p+1].set_title('Key')
         ax[2, p+1].imshow(slice, cmap='gray', aspect=norm_ratio_2[2] / norm_ratio_2[1])
         ax[2, p+1].plot((pts2[p, 1]), (k_img.shape[0] - pts2[p, 2] - 1), 'o',
                       markerfacecolor='none',
                       markeredgecolor="red",
-                      markersize=12, markeredgewidth=2)
-        plt.suptitle(f'score:{score}')
+                      markersize=30, markeredgewidth=5)
+        ax[2, p+1].axis('off')
+        # plt.suptitle(f'score:{score}')
     plt.tight_layout()
     if save_path is None:
-        plt.show()  # may be slow
+        plt.show()
+        plt.close()
     else:
-        plt.savefig(save_path)
+        os.makedirs(save_path, exist_ok=True)
+        plt.savefig(os.path.join(save_path,
+            # f'viz_{pt1[0]}_{pt1[1]}_{pt1[2]}.png'))
+            f'viz_sam.png'))
+        plt.close()
+
 
 
 def draw_patch(im, box, patch_size=100, color=(0, 255, 0), add_boxes=None, add_color=None):
@@ -1107,18 +1123,19 @@ def random_mask(args, img_list):
     mask_list = []
     mask_patch_size = [8, 16, 32]
     for img in img_list:
+        # print("img.size(): ", img.size())
         bs, c, h, w, z  = img.size()
             
         mask_generator = MaskGenerator(
-        input_size=(h, w, z),
-        mask_patch_size=args.patch_size,
-        # mask_patch_size=choice(mask_patch_size),
-        model_patch_size=2,
-        mask_ratio=args.mask_ratio,
+            input_size=(h, w, z),
+            mask_patch_size=args.patch_size,
+            # mask_patch_size=choice(mask_patch_size),
+            model_patch_size=2,
+            mask_ratio=args.mask_ratio,
         )
             
         mask_volume = mask_generator().type(torch.FloatTensor)
-        mask_list.append(mask_volume.unsqueeze(0).unsqueeze(0))
+        mask_list.append(mask_volume.unsqueeze(0).unsqueeze(0))  # Append expanded mask
     return mask_list
 
 
@@ -1151,6 +1168,38 @@ def select_random_points(num_pts, im):
         iters += 1
     return np.vstack(pts)
 
+PREDEFINED_POINTS = [
+    (47, 64, 63),  # Hippocampus
+    (57, 106, 37),  # Frontal lobe
+    (37, 56, 87)   # Temporal lobe
+]
+
+def select_predefined_points(num_pts, im):
+    """
+    Randomly selects points from predefined coordinates (Hippocampus, Frontal lobe, Temporal lobe)
+    that satisfy conditions within the MRI volume.
+    
+    Args:
+        num_pts (int): Number of points to select.
+        im (numpy.ndarray): MRI volume as a 3D array.
+        
+    Returns:
+        numpy.ndarray: Array of selected points (num_pts, 3).
+    """
+    im = im[0, 0]  # Assuming the input image has extra dimensions at the start
+    d, w, h = im.shape[0], im.shape[1], im.shape[2]  # Get dimensions of the 3D volume
+    
+    pts = []  # List to store selected points
+    iters = 0  # Counter for iterations
+    
+    while len(pts) < num_pts:
+        # Randomly select a point from the predefined list
+        pt1 = np.array(PREDEFINED_POINTS[np.random.randint(0, len(PREDEFINED_POINTS))])
+        pts.append(pt1)
+        
+        iters += 1
+    
+    return np.vstack(pts)
 
 def crop_tensor_new(img, pts, roi_x, roi_y, roi_z):
     img_n, c, h, w, d = img.size()
@@ -1185,3 +1234,176 @@ def data_aug(args, x_s):
         x = random_rotate(x).permute(0, 2, 3, 1)
         x_aug[i] = x.to(device) + (0.01**0.5)*torch.randn(c, h, w, d).to(device)
     return x_aug
+
+def visualize_crop(q_img, k_img, save_path=None):
+    # Create a subplot for 3 slices (xy, xz, yz) for both query and key
+    fig, ax = plt.subplots(3, 2, figsize=(12, 12))
+
+    # Planes to plot
+    planes = [
+        (lambda img: img[31, :, :], 'XY Plane'),
+        (lambda img: img[:, 31, :], 'XZ Plane'),
+        (lambda img: img[:, :, 31], 'YZ Plane'),
+    ]
+
+    # Plot query slices
+    for i, (plane_func, title) in enumerate(planes):
+        slice_q = plane_func(q_img)
+        ax[i, 0].imshow(slice_q, cmap='gray', aspect='equal')
+        ax[i, 0].set_title(f'Query')
+        ax[i, 0].axis('off')  # Remove axis numbers and ticks
+        
+    # Plot key slices
+    for i, (plane_func, title) in enumerate(planes):
+        slice_k = plane_func(k_img)
+        ax[i, 1].imshow(slice_k, cmap='gray', aspect='equal')
+        ax[i, 1].set_title(f'Key')
+        ax[i, 1].axis('off')  # Remove axis numbers and ticks
+
+    # Adjust spacing between subplots to make the axes closer horizontally
+    plt.subplots_adjust(wspace=0.1)
+
+    plt.tight_layout()
+    if save_path is None:
+        plt.show()
+    else:
+        os.makedirs(save_path, exist_ok=True)
+        plt.savefig(os.path.join(save_path, 'croppedcubes.png'))
+        plt.close()
+
+def plot_images(images_raw_np, images_masked_np, student_decoder_np, save_path=None):
+    """
+    Plots the original image, masked image, and predicted image.
+
+    Args:
+        images_raw (torch.Tensor): Original images tensor of shape (N, 1, H, W, D).
+        images_masked (torch.Tensor): Masked images tensor of shape (N, 1, H, W, D).
+        student_decoder (torch.Tensor): Predicted images tensor of shape (N, 1, H, W, D).
+    """
+    # # Ensure inputs are numpy arrays for plotting
+    # def to_numpy(tensor):
+    #     return tensor.squeeze().detach().cpu().numpy()
+
+    # images_raw_np = to_numpy(images_raw)
+    # images_masked_np = to_numpy(images_masked)
+    # student_decoder_np = to_numpy(student_decoder)
+
+    # Select a slice along the depth (z-axis) for visualization
+    # z_slice = images_raw_np.shape[-1] // 2  # Middle slice
+
+    # fig, axes = plt.subplots(2, 3, figsize=(15, 15))
+    # # fig.suptitle("Original Image, Masked Image, and Predicted Image", fontsize=16)
+    
+    # j = 0
+    # for i in range(len(images_raw_np)):
+    #     if i not in [0, 8]:
+    #         continue
+    #     # Original image
+    #     axes[j, 0].imshow(images_raw_np[i, :, :, z_slice], cmap='gray')
+    #     axes[j, 0].set_title(f"Original")
+    #     axes[j, 0].axis('off')
+
+    #     # Masked image
+    #     axes[j, 1].imshow(images_masked_np[i, :, :, z_slice], cmap='gray')
+    #     axes[j, 1].set_title(f"Masked")
+    #     axes[j, 1].axis('off')
+
+    #     # Predicted image
+    #     axes[j, 2].imshow(student_decoder_np[i, :, :, z_slice], cmap='gray')
+    #     axes[j, 2].set_title(f"Prediction")
+    #     axes[j, 2].axis('off')
+        
+    #     j += 1
+
+    #     # Select a slice along the x-axis for visualization
+    # x_slice = images_raw_np.shape[2] // 2  # Middle slice along the x-axis
+
+    # fig, axes = plt.subplots(2, 3, figsize=(15, 15))
+
+    # j = 0
+    # for i in range(len(images_raw_np)):
+    #     if i not in [0, 8]:
+    #         continue
+    #     # Original image
+    #     axes[j, 0].imshow(images_raw_np[i, :, x_slice, :], cmap='gray')
+    #     axes[j, 0].set_title(f"Original")
+    #     axes[j, 0].axis('off')
+
+    #     # Masked image
+    #     axes[j, 1].imshow(images_masked_np[i, :, x_slice, :], cmap='gray')
+    #     axes[j, 1].set_title(f"Masked")
+    #     axes[j, 1].axis('off')
+
+    #     # Predicted image
+    #     axes[j, 2].imshow(student_decoder_np[i, :, x_slice, :], cmap='gray')
+    #     axes[j, 2].set_title(f"Prediction")
+    #     axes[j, 2].axis('off')
+
+    #     j += 1
+
+        # Select a slice along the first dimension (y-slice) for visualization
+    x_slice = images_raw_np.shape[2] // 2  # Middle slice along the x-axis
+    y_slice = images_raw_np.shape[1] // 2  # Middle slice along the first dimension
+    z_slice = images_raw_np.shape[-1] // 2  # Middle slice
+
+    fig, axes = plt.subplots(6, 3, figsize=(6, 10)) 
+
+    j = 0
+    for i in range(len(images_raw_np)):
+        if i not in [0, 8]:
+            continue
+        # Original image
+        axes[j, 0].imshow(images_raw_np[i, y_slice, :, :], cmap='gray')
+        axes[j, 0].set_title(f"Original")
+        axes[j, 0].axis('off')
+
+        # Masked image
+        axes[j, 1].imshow(images_masked_np[i, y_slice, :, :], cmap='gray')
+        axes[j, 1].set_title(f"Masked")
+        axes[j, 1].axis('off')
+
+        # Predicted image
+        axes[j, 2].imshow(student_decoder_np[i, y_slice, :, :], cmap='gray')
+        axes[j, 2].set_title(f"Prediction")
+        axes[j, 2].axis('off')
+        j += 1
+
+        axes[j, 0].imshow(images_raw_np[i, :, x_slice, :], cmap='gray')
+        axes[j, 0].set_title(f"Original")
+        axes[j, 0].axis('off')
+
+        # Masked image
+        axes[j, 1].imshow(images_masked_np[i, :, x_slice, :], cmap='gray')
+        axes[j, 1].set_title(f"Masked")
+        axes[j, 1].axis('off')
+
+        # Predicted image
+        axes[j, 2].imshow(student_decoder_np[i, :, x_slice, :], cmap='gray')
+        axes[j, 2].set_title(f"Prediction")
+        axes[j, 2].axis('off')
+        j += 1
+
+        axes[j, 0].imshow(images_raw_np[i, :, :, z_slice], cmap='gray')
+        axes[j, 0].set_title(f"Original")
+        axes[j, 0].axis('off')
+
+        # Masked image
+        axes[j, 1].imshow(images_masked_np[i, :, :, z_slice], cmap='gray')
+        axes[j, 1].set_title(f"Masked")
+        axes[j, 1].axis('off')
+
+        # Predicted image
+        axes[j, 2].imshow(student_decoder_np[i, :, :, z_slice], cmap='gray')
+        axes[j, 2].set_title(f"Prediction")
+        axes[j, 2].axis('off')
+        j += 1
+
+    plt.subplots_adjust(hspace=0.1, wspace=0.01)  # Reduce vertical and horizontal spacing
+    plt.tight_layout()  # Ensure no overlap
+
+    if save_path is None:
+        plt.show()
+    else:
+        os.makedirs(save_path, exist_ok=True)
+        plt.savefig(os.path.join(save_path, 'ori-mask-pre.png'))
+        plt.close()

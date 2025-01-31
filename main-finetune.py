@@ -14,18 +14,18 @@ import torch.distributed as dist
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 from tqdm import tqdm
-from models.nnFormer import nnFormer
+from models.nnFormer import nnFormer, Encoder
 from interfaces import init_model, get_embedding, find_point_in_vol
 import pickle
-
+import pprint
 from pathlib import Path
 from PIL import Image
 from torchvision import datasets, transforms
 from torchvision import models as torchvision_models
 from tensorboardX import SummaryWriter
 
-from models.head import AliceHead
-from loader import get_loader, get_loader_adni_ukb
+from models.head import AliceHead, ClassificationHead2FC, ClassificationHead3FC, ClassificationHeadCLS
+from loader import get_loader, get_loader_adni_ukb, get_loader_hos_dzne
 from loss import Loss
 from CASA import CASA_Module
 from engine_pretrain import train_one_epoch
@@ -35,7 +35,9 @@ from torch.multiprocessing import Process
 import torch.utils.data.distributed
 import torch.distributed as dist
 import wandb
-
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, balanced_accuracy_score
+from models.attentive_pooler import AttentiveClassifier
+import tempfile
 
 # from evaluation.unsupervised.unsup_cls import eval_pred
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -43,6 +45,11 @@ torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.allow_tf32 = True
 
+if not torch.cuda.is_available():
+    device = torch.device('cpu')
+else:
+    device = torch.device('cuda:0')
+    torch.cuda.set_device(device)
 
 def get_args_parser():
     parser = argparse.ArgumentParser('Alice', add_help=False)
@@ -97,7 +104,7 @@ def get_args_parser():
         loss over [CLS] tokens (Default: 1.0)""")
     parser.add_argument('--lambda2', default=1.0, type=float, help="""loss weight for contrastive 
         loss over patch token embeddings (Default: 1.0)""")
-    parser.add_argument('--lambda3', default=1.0, type=float, help="""loss weight for MAE 
+    parser.add_argument('--lambda3', default=10, type=float, help="""loss weight for MAE 
         loss over masked patch tokens (Default: 1.0)""")       
     # Temperature teacher parameters
     parser.add_argument('--warmup_teacher_temp', default=0.008, type=float,
@@ -152,15 +159,15 @@ def get_args_parser():
     parser.add_argument('--a_max', default=225, type=float, help='a_max in ScaleIntensityRanged')
     parser.add_argument('--b_min', default=0.0, type=float, help='b_min in ScaleIntensityRanged')
     parser.add_argument('--b_max', default=1.0, type=float, help='b_max in ScaleIntensityRanged')
-    parser.add_argument('--roi_x', default=64, type=int, help='roi size in x direction')
-    parser.add_argument('--roi_y', default=64, type=int, help='roi size in y direction')
-    parser.add_argument('--roi_z', default=64, type=int, help='roi size in z direction')
-    parser.add_argument('--batch_size', default=16, type=int, help='number of batch size')
+    parser.add_argument('--roi_x', default=32, type=int, help='roi size in x direction')
+    parser.add_argument('--roi_y', default=32, type=int, help='roi size in y direction')
+    parser.add_argument('--roi_z', default=32, type=int, help='roi size in z direction')
+    parser.add_argument('--batch_size', default=8, type=int, help='number of batch size')
     parser.add_argument('--sw_batch_size', default=2, type=int, help='number of sliding window batch size')
     parser.add_argument('--normal_dataset', default=False, action='store_true', help='use monai Dataset class')
     parser.add_argument('--smartcache_dataset', default=False, action='store_true', help='use monai smartcache Dataset class')
-    parser.add_argument('--adni_dataset', default=False, action='store_true', help='use adni Dataset class')
-    parser.add_argument('--ukb_dataset', default=False, action='store_true', help='use ukb Dataset class')
+    parser.add_argument('--dzne_dataset', default=False, action='store_true', help='use adni Dataset class')
+    parser.add_argument('--hos_dataset', default=False, action='store_true', help='use ukb Dataset class')
 
     parser.add_argument('--distributed', action='store_true', default=True, help='enable distributed training')
     parser.add_argument("--threshold", type=float, default=0.6, help="""We visualize masks
@@ -186,37 +193,53 @@ def get_args_parser():
     parser.add_argument("--gpu", default=0, type=int, help="Please ignore and do not set this argument.")
     
     parser.add_argument('--disable_wandb', default=False, action='store_true', help='whether to use wandb logging')
-    
+    parser.add_argument('--atp', default=False, action='store_true', help='whether to use attentive pooling')
+    parser.add_argument('--pretrain_ds', default="adni")
+    parser.add_argument('--fc2', default=False, action='store_true', help='number of fc layers for finetuning')
+    parser.add_argument('--fc3', default=False, action='store_true', help='number of fc layers for finetuning')
+    parser.add_argument('--contrastive', default=False, action='store_true')
+    parser.add_argument('--resize', default=False, action='store_true')
+    parser.add_argument('--scratch', default=False, action='store_true')
+    parser.add_argument('--predefine_points', default=False, action='store_true')
+    parser.add_argument('--CLS', default=False, action='store_true')
+
     return parser
 
-def train_Alice(args):
-    utils.init_distributed_mode(args)
+def train_FT(args, f=1):
+   
     # utils.fix_random_seeds(args.seed)
     
     # ============ preparing data ... ============
     pred_size = args.patch_size * 8 if 'swin' in args.arch else args.patch_size
     # data_loader, test_loader = get_loader(args)
-    data_loader, test_loader = get_loader_adni_ukb(args)
 
-    print(f"Data loaded: there are {len(data_loader)} images.")
+    #TODO load dzne, hospital dataset
+    train_loader = get_loader_hos_dzne(args, fold=f, mode="train")
+    val_loader =  get_loader_hos_dzne(args, fold=f, mode="val")
+    test_loader = get_loader_hos_dzne(args, fold=f, mode="test")
+
+    print(f"Data loaded: there are {len(train_loader)} train_loader.")
+    print(f"Data loaded: there are {len(val_loader)} val_loader.")
+    print(f"Data loaded: there are {len(test_loader)} test_loader.")
 
     # ============ building student and teacher networks ... ============
+    # encoder = Encoder(
+    #         img_size=(args.roi_x, args.roi_y, args.roi_z), 
+    #         embed_dim=args.feature_size,
+    #         depths=[2, 2, 2, 2],
+    #         num_heads=[6, 12, 24, 48],
+    #         patch_size=[2, 2, 2],
+    #         window_size=[4, 4, 8, 4],
+    #         in_chans=args.in_channels
+    #         ).to(device)
     student = nnFormer(
               img_size=(args.roi_x, args.roi_y, args.roi_z),
               input_channels=args.in_channels,
               output_channels=args.out_channels,
               embedding_dim=args.feature_size,
               )
-    teacher = nnFormer(
-              img_size=(args.roi_x, args.roi_y, args.roi_z),
-              input_channels=args.in_channels,
-              output_channels=args.out_channels,
-              embedding_dim=args.feature_size,
-              )
+   
     embed_dim = args.feature_size * (2 ** 3)
-    
-    casa_module = CASA_Module.CASA(args.out_dim, 2048, 8, 64, 64).cuda()
-    casa_module = nn.parallel.DistributedDataParallel(casa_module, device_ids=[args.gpu], broadcast_buffers=False, find_unused_parameters=True)
     
     # multi-crop wrapper handles forward with inputs of different resolutions
     student = utils.MultiCropWrapper(
@@ -231,70 +254,80 @@ def train_Alice(args):
             shared_head=args.shared_head,
         ),
     )
-    teacher = utils.MultiCropWrapper(
-        teacher,
-        AliceHead(
-            embed_dim, 
-            args.out_dim,
-            patch_out_dim=args.patch_out_dim,
-            norm=args.norm_in_head,
-            act=args.act_in_head,
-            shared_head=args.shared_head_teacher,
-        ),
-    )
     # move networks to gpu
-    student, teacher = student.cuda(), teacher.cuda()
+    student = student.cuda()
+
     # synchronize batch norms (if any)
     if utils.has_batchnorms(student):
         student = nn.SyncBatchNorm.convert_sync_batchnorm(student)
-        teacher = nn.SyncBatchNorm.convert_sync_batchnorm(teacher)
 
-        # we need DDP wrapper to have synchro batch norms working...
-        teacher = nn.parallel.DistributedDataParallel(teacher, device_ids=[args.gpu], broadcast_buffers=False, find_unused_parameters=True) if \
-            'nnformer' in args.arch else nn.parallel.DistributedDataParallel(teacher, device_ids=[args.gpu], find_unused_parameters=True)
-        teacher_without_ddp = teacher.module
-    else:
-        # teacher_without_ddp and teacher are the same thing
-        teacher_without_ddp = teacher
     student = nn.parallel.DistributedDataParallel(student, device_ids=[args.gpu], broadcast_buffers=False, find_unused_parameters=True) if \
         'nnformer' in args.arch else nn.parallel.DistributedDataParallel(student, device_ids=[args.gpu], find_unused_parameters=True)
-    # teacher and student start with the same weights
-    teacher_without_ddp.load_state_dict(student.module.state_dict(), strict=False)
+   
+    # encoder = nn.parallel.DistributedDataParallel(encoder)
+    # encoder = nn.parallel.DistributedDataParallel(encoder, device_ids=[args.gpu], find_unused_parameters=True)
+    # #TODO load student from checkpoint
+    if not args.scratch:
+        print("Loading the model from: ", args.checkpoint_file)
+        checkpoint = torch.load(args.checkpoint_file, map_location="cuda" if torch.cuda.is_available() else "cpu")
+        # Load state_dict
+        student.load_state_dict(checkpoint['student'])
 
-    # there is no backpropagation through the teacher, so no need for gradients
-    for p in teacher.parameters():
-        p.requires_grad = False
-    print(f"Student and Teacher are built: they are both {args.arch} network.")
+    # # Extract state dict for student
+    # student_state_dict = checkpoint['student']
+    # # Remap keys to match what the encoder expects
+    # remapped_state_dict = {}
+    # for k, v in student_state_dict.items():
+    #     # Remap 'module.backbone.model_down' to 'module'
+    #     if k.startswith("module.backbone.model_down."):
+    #         new_key = k.replace("module.backbone.model_down.", "module.")
+    #         remapped_state_dict[new_key] = v
+
+    # # Load the remapped state dict into the encoder
+    # encoder.load_state_dict(remapped_state_dict, strict=False)
+
+    if args.atp:
+        classifier = AttentiveClassifier(
+            embed_dim=args.out_dim,
+            # num_heads=encoder.module.num_heads,
+            num_heads=8, 
+            depth=1,
+            num_classes=3
+        )
+    elif args.fc2: 
+        #TODO classification head 
+        #or wrap student and classification head together.
+        # TODO add layernorm and pooling and try again
+        classifier = ClassificationHead2FC(input_dim=args.out_dim, num_classes=3)
+    elif args.CLS:
+        classifier = ClassificationHeadCLS(input_dim=args.out_dim, num_classes=3)
+    else:
+        classifier = ClassificationHead3FC(input_dim=args.out_dim, num_classes=3)
+
+    criterion = nn.CrossEntropyLoss()
     
-    
-    # ============ building SAM model ... ============    
-    sam_model, sam_cfg = init_model(args.config_file, args.checkpoint_file)
 
-    # ============ preparing loss ... ============
-    same_dim = args.shared_head or args.shared_head_teacher
-    alice_loss = Loss(
-        args.out_dim,
-        args.out_dim if same_dim else args.patch_out_dim,
-        args.global_crops_number,
-        args.warmup_teacher_temp,
-        args.teacher_temp,
-        args.warmup_teacher_patch_temp,
-        args.teacher_patch_temp,
-        args.warmup_teacher_temp_epochs,
-        args.epochs,
-        lambda1=args.lambda1,
-        lambda2=args.lambda2,
-        lambda3=args.lambda3,
-        mim_start_epoch=args.pred_start_epoch,
-    ).cuda()
+    classifier = classifier.cuda()
 
-    if utils.is_main_process(): # Tensorboard configuration
-        local_runs = os.path.join(args.output_dir, 'tf_logs')
-        writer = SummaryWriter(logdir=local_runs)
+    # TODO frozen backbone or not
+    # Freeze all parameters by default
+    for param in student.parameters():
+        param.requires_grad = False
+
+
+    # Unfreeze parameters in student.module.backbone.model_down except those starting with "backbone.model_down.norm"
+    for name, param in student.module.backbone.model_down.named_parameters():
+        if not name.startswith("norm"):  # Check if the name does not start with "norm"
+            param.requires_grad = True
+
+
+    # print(f"Encoder is built.")
+    print(f"Student is built: it is {args.arch} network.")
         
     # ============ preparing optimizer ... ============
+    # params_groups = utils.get_params_groups_dual(encoder, classifier)
+    params_groups = utils.get_params_groups_dual(student, classifier)
     # params_groups = utils.get_params_groups(student)
-    params_groups = utils.get_params_groups_dual(student, casa_module)
     
     if args.optimizer == "adamw":
         optimizer = torch.optim.AdamW(params_groups)  # to use with ViTs
@@ -312,18 +345,15 @@ def train_Alice(args):
         args.lr, #* (args.batch_size * utils.get_world_size()) / 256.,  # linear scaling rule
         args.min_lr,
         args.epochs, 
-        len(data_loader),
+        len(train_loader),
         warmup_epochs=args.warmup_epochs,
     )
     wd_schedule = utils.cosine_scheduler(
         args.weight_decay, 
         args.weight_decay_end,
         args.epochs, 
-        len(data_loader),
+        len(train_loader),
     )
-    # momentum parameter is increased to 1. during training with a cosine schedule
-    momentum_schedule = utils.cosine_scheduler(args.momentum_teacher, 1,
-                                            args.epochs, len(data_loader))
                   
     print(f"Loss, optimizer and schedulers ready.")
 
@@ -334,7 +364,7 @@ def train_Alice(args):
             os.path.join(args.output_dir, args.load_from),
             run_variables=to_restore,
             student=student,
-            teacher=teacher,
+            classifier=classifier,
             optimizer=optimizer,
             fp16_scaler=fp16_scaler,
             alice_loss=alice_loss,
@@ -342,56 +372,140 @@ def train_Alice(args):
     start_epoch = to_restore["epoch"]
 
     start_time = time.time()
-    print("Starting training Alice!")
+    print("Starting finetuning Alice!")
     
     best_val = 1e8
-    global memory_queue_patch
-    memory_queue_patch = 0
     
-    iters = start_epoch*len(data_loader)
+    iters = 0 # global training iteration
     for epoch in range(start_epoch, args.epochs):
-        data_loader.sampler.set_epoch(epoch)
-        # data_loader.dataset.set_epoch(epoch)
+        train_loader.sampler.set_epoch(epoch)
+        # print("epoch: ", epoch)
 
-        # ============ training one epoch of Alice ... ============
-        train_stats, iters = train_one_epoch(student, teacher, teacher_without_ddp, alice_loss,
-            data_loader, optimizer, lr_schedule, wd_schedule, momentum_schedule,
-            epoch, fp16_scaler, sam_cfg, casa_module, sam_model, iters, args)
+        # ============ training one epoch ... ============
+        for itr, batch_data in enumerate(train_loader):
+            # print("iteration: ", itr)
+            imgs = batch_data['img'].to(device, non_blocking=True)
+            # print("imgs.shape: ", imgs.shape)
+
+            if not args.resize:
+                #random crop
+                if args.predefine_points:
+                    pts = utils.select_predefined_points(1, imgs.transpose(2, 4))
+                else:
+                    pts = utils.select_random_points(1, imgs.transpose(2, 4))
+                pts1 = pts[0]
+                imgs =  utils.crop_tensor_new(imgs, pts1, args.roi_x, args.roi_y, args.roi_z).to(device)
+
+            target = batch_data['label'].to(device, non_blocking=True)
+            target = torch.argmax(target, dim=1)
+            target = target.long()
+
+            for i, param_group in enumerate(optimizer.param_groups):
+                param_group["lr"] = lr_schedule[iters]
+                if i == 0:  # only the first group is regularized
+                    param_group["weight_decay"] = wd_schedule[iters]
+
+            with torch.cuda.amp.autocast(fp16_scaler is not None):
+                
+                # encoder_output = encoder(imgs)
+                # en_feat = encoder_output[0][-1]
+
+                student_output = student(imgs)
+                clstoken, en_feat = student_output[0], student_output[1]
+                # print("clstoken shape: ", clstoken.shape) # torch.Size([8, 512])
+                # en_feat = student_output[1]
+                #TODO try using both for classification task
+                # print("en_feat shape: ", en_feat.shape) # torch.Size([8, 8, 512])
+                if args.CLS:
+                    outputs = classifier(clstoken)
+                else:
+                    outputs = classifier(en_feat)
+                # outputs = classifier(clstoken)
+                # print("Outputs shape:", outputs.shape)  # Should be (batch_size, num_classes)
+                # print("Target shape:", target.shape)   # Should be (batch_size,)
+                # print("Target dtype:", target.dtype)   # Should be torch.long
+            loss = criterion(outputs, target)
+
+            optimizer.zero_grad()
+            if fp16_scaler is None:
+                loss.backward()
+                # if args.clip_grad:
+                #     param_norms = utils.clip_gradients(student, args.clip_grad)
+                # utils.cancel_gradients_last_layer(epoch, student,
+                #                                 args.freeze_last_layer)
+                optimizer.step()
+            else:
+                fp16_scaler.scale(loss).backward()
+                # if args.clip_grad:
+                #     fp16_scaler.unscale_(optimizer)  # unscale the gradients of optimizer's assigned params in-place
+                #     param_norms = utils.clip_gradients(student, args.clip_grad)
+                # utils.cancel_gradients_last_layer(epoch, student,
+                #                                 args.freeze_last_layer)
+                fp16_scaler.step(optimizer)
+                fp16_scaler.update()
+
+
+            if not args.disable_wandb:
+                wandb.log(
+                    {
+                    f"Fold {f} - lr": optimizer.param_groups[0]['lr'],
+                    f"Fold {f} - Training Loss": loss,
+                    "custom_step": iters,
+                    },
+                )
+            iters += 1
 
         # ============ writing logs ... ============
         save_dict = {
             'student': student.state_dict(),
-            'teacher': teacher.state_dict(),
+            "classifier": classifier.state_dict(), 
             'optimizer': optimizer.state_dict(),
             'epoch': epoch + 1,
             'args': args,
-            'alice_loss': alice_loss.state_dict(),
         }
         
         if args.eval_epoch and (epoch % args.eval_epoch == 0):
-            val_stats = validation(args, student, teacher, alice_loss, test_loader, epoch, sam_model, sam_cfg, casa_module)
-            
-            if not args.disable_wandb: 
+            # iterate over validation dataloader
+            val_losses = []
+            for itr, batch_data in enumerate(val_loader):
+                imgs = batch_data['img'].to(device, non_blocking=True)
+                if not args.resize:
+                    #random crop
+                    if args.predefine_points:
+                        pts = utils.select_predefined_points(1, imgs.transpose(2, 4))
+                    else:
+                        pts = utils.select_random_points(1, imgs.transpose(2, 4))
+                    pts1 = pts[0]
+                    imgs =  utils.crop_tensor_new(imgs, pts1, args.roi_x, args.roi_y, args.roi_z).to(device)
+
+                target = batch_data['label'].to(device, non_blocking=True)
+                target = torch.argmax(target, dim=1)
+                target = target.long()
+                with torch.cuda.amp.autocast(fp16_scaler is not None):
+                    with torch.no_grad():
+                        student_output = student(imgs)
+                        clstoken, en_feat = student_output[0], student_output[1]
+                        #TODO try using both for classification task
+                        if args.CLS:
+                            outputs = classifier(clstoken)
+                        else:
+                            outputs = classifier(en_feat)
+                loss = criterion(outputs, target)    
+                val_losses.append(float(loss))
+
+                assert not np.isnan(float(loss)), 'loss is nan'
+
+            # logging
+            if not args.disable_wandb:
                 wandb.log(
                     {
-                    "validation - total Loss": val_stats['val_loss'],
-                    "validation - recon loss": val_stats['val_recon'],
-                    "validation - cls loss": val_stats['val_cls'],
-                    "validation - patch loss": val_stats['val_patch'],
+                    f"Fold {f} - Validation Loss": np.average(val_losses),
+                    "custom_step": iters,
                     },
-                    step=iters,
                 )
 
-            log_val_stats = {**{f'{k}': v for k, v in val_stats.items()},
-                     'epoch': epoch}
-            if utils.is_main_process():
-                with (Path(args.output_dir) / "log_val.txt").open("a") as f:
-                    f.write(json.dumps(log_val_stats) + "\n")
-                    for k, v in val_stats.items():
-                        writer.add_scalar(k, v, epoch)
-
-            if val_stats['val_loss'] < best_val:
-                best_val = val_stats['val_loss']
+            if np.average(val_losses) < best_val:
+                best_val = np.average(val_losses)
                 utils.save_on_master(save_dict, os.path.join(args.output_dir, f'checkpoint_bestval.pth'))
                 print('Model was saved ! Best Val Loss: {}'.format(best_val))
             else:
@@ -403,38 +517,127 @@ def train_Alice(args):
         if args.saveckp_freq and (epoch % args.saveckp_freq == 0) and epoch:
             utils.save_on_master(save_dict, os.path.join(args.output_dir, f'checkpoint{epoch:04}.pth'))
         
-        log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                     'epoch': epoch}
-        if utils.is_main_process():
-            with (Path(args.output_dir) / "log.txt").open("a") as f:
-                f.write(json.dumps(log_stats) + "\n")
-                for k, v in train_stats.items():
-                    writer.add_scalar(k, v, epoch)
-        
-    total_time = time.time() - start_time
-    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print('Training time {}'.format(total_time_str))
+    #TESTING
+    test_losses = []
+    predictions = []
+    label_test = []
+    #iterate over test dataloader
+    for itr, batch_data in enumerate(test_loader):
+        imgs = batch_data['img'].to(device, non_blocking=True)
+
+        if not args.resize:
+            #random crop
+            if args.predefine_points:
+                pts = utils.select_predefined_points(1, imgs.transpose(2, 4))
+            else:
+                pts = utils.select_random_points(1, imgs.transpose(2, 4))
+            pts1 = pts[0]
+            imgs =  utils.crop_tensor_new(imgs, pts1, args.roi_x, args.roi_y, args.roi_z).to(device)
+
+        target = batch_data['label'].to(device, non_blocking=True)
+        target = torch.argmax(target, dim=1)
+        target = target.long()
+        with torch.cuda.amp.autocast(fp16_scaler is not None):
+            with torch.no_grad():
+                student_output = student(imgs)
+                clstoken, en_feat = student_output[0], student_output[1]
+                #TODO try using both for classification task
+                if args.CLS:
+                    outputs = classifier(clstoken)
+                else:
+                    outputs = classifier(en_feat)
+            predictions.extend(torch.argmax(outputs, dim=1).tolist())
+            label_test.extend(target.tolist())
+
+        loss = criterion(outputs, target)    
+        test_losses.append(float(loss))
+
+    accuracy = accuracy_score(label_test, predictions)
+    bal_acc = balanced_accuracy_score(label_test, predictions)
+    precision = precision_score(label_test, predictions, average='macro')
+    recall = recall_score(label_test, predictions, average='macro')
+    f1 = f1_score(label_test, predictions, average='macro')
+
+
+    log_string = f" ===> Test loss: {np.average(test_losses):.05f} \n "
+    log_string += f"===> Accuracy: {accuracy:.05f} \n "
+    log_string += f"===> Balanced Accuracy: {bal_acc:.05f} \n "
+    log_string += f"===> Precision: {precision:.05f} \n "
+    log_string += f"===> Recall: {recall:.05f} \n "
+    log_string += f"===> F1-score: {f1:.05f} \n "
+    log_string += f"===> Predictions: {predictions} \n "
+    log_string += f"===> Labels: {label_test} \n "
+
+    print(log_string)
+
+    return np.average(test_losses), accuracy, bal_acc, precision, recall, f1
      
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('Alice', parents=[get_args_parser()])
     args = parser.parse_args()
+    utils.init_distributed_mode(args)
+
+    pp = pprint.PrettyPrinter(indent=4)
+    pp.pprint(args)
 
     if not args.disable_wandb:
-        if args.load_from:
-            wandb_id = "1e831c0g"
-        else:   
-            wandb_id = wandb.util.generate_id()
-        
-        ds = "adni" if args.adni_dataset else "ukb"
-        run = wandb.init(project=f"alice_{ds}", 
-                        name=f"{args.arch}_bs{args.batch_size}_ep{args.epochs}_lr{args.lr}_{args.roi_x}^3", 
+        wandb_id = wandb.util.generate_id()
+        ds = "dzne" if args.dzne_dataset else "hospital"
+        if args.atp:
+            ft = "atp"
+        elif args.fc2:
+            ft = "2fc"
+        elif args.CLS:
+            ft = "cls"
+        else:
+            ft = "3fc"
+
+        pretrain_type = "contra" if args.contrastive else "all"
+        pretrain_type = "scratch" if args.scratch else pretrain_type
+
+        run = wandb.init(project=f"alice_ft_{ds}", 
+                        name=f"{pretrain_type}_{args.pretrain_ds}_{ft}_bs{args.batch_size}_ep{args.epochs}_lr{args.lr}_{args.roi_x}^3", 
                         id=wandb_id,
                         resume='allow',
-                        dir=args.output_dir)
+                        # dir=args.output_dir
+                        dir=tempfile.mkdtemp() 
+                        )
 
-    torch.cuda.set_device(args.local_rank)
+
+
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    train_Alice(args)
+    # 5 folds 
+    fivefolds_test_loss = []
+    fivefolds_test_accuracy = []
+    fivefolds_test_bal_accuracy = []
+    fivefold_test_precision = []
+    fivefold_test_recall = []
+    fivefold_test_f1 = []
+
+    for f in range(1,6):
+        if not args.disable_wandb:
+            # define which metrics will be plotted against it
+            wandb.define_metric(f"Fold {f} - lr", step_metric="custom_step")
+            wandb.define_metric(f"Fold {f} - Training Loss", step_metric="custom_step")
+            wandb.define_metric(f"Fold {f} - Validation Loss", step_metric="custom_step")
+
+        #when do we use the folds? dataloader?
+        print(f"################ Fold {f} ####################")
+        test_loss, accuracy, bal_acc, precision, recall, f1= train_FT(args, f=f)
+
+        fivefolds_test_loss.append(test_loss)
+        fivefolds_test_accuracy.append(accuracy)
+        fivefolds_test_bal_accuracy.append(bal_acc)
+        fivefold_test_precision.append(precision)
+        fivefold_test_recall.append(recall)
+        fivefold_test_f1.append(f1)
+
+    print(f"Average Test Loss: {np.mean(fivefolds_test_loss)}, std: {np.std(fivefolds_test_loss)}")
+    print(f"Average Test Accuracy: {np.mean(fivefolds_test_accuracy)}, std: {np.std(fivefolds_test_accuracy)}")
+    print(f"Average Test Balanced Accuracy: {np.mean(fivefolds_test_bal_accuracy)}, std: {np.std(fivefolds_test_bal_accuracy)}")
+    print(f"Average Test Precision: {np.mean(fivefold_test_precision)}, std: {np.std(fivefold_test_precision)}")
+    print(f"Average Test Recall: {np.mean(fivefold_test_recall)}, std: {np.std(fivefold_test_recall)}")
+    print(f"Average Test F1: {np.mean(fivefold_test_f1)}, std: {np.std(fivefold_test_f1)}")
 
     if args.local_rank == 0 and not args.disable_wandb:
         run.finish()

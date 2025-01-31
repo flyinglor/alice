@@ -110,8 +110,9 @@ class Loss(nn.Module):
         mask_raw = torch.cat([nn.functional.interpolate(masks[0], size=(h, w, z), mode="nearest").cuda(non_blocking=True), nn.functional.interpolate(masks[1], size=(h, w, z), mode="nearest").cuda(non_blocking=True)], dim=0)
 
         total_loss3 = self.mae_loss(images_raw, student_decoder) / 2 * self.lambda3
-
         total_loss = dict(cls=total_loss1, patch=total_loss2, recon=total_loss3, loss=total_loss1 + total_loss2 + total_loss3)
+
+        # total_loss = dict(cls=total_loss1, patch=total_loss2, loss=total_loss1 + total_loss2 + 0*total_loss3)
         self.update_center(teacher_cls, teacher_patch)
         # self.update_center(teacher_cls1, teacher_cls2, teacher_patch)    
         return total_loss

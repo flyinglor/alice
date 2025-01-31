@@ -1,3 +1,5 @@
+torch==1.9.0+cu111
+torchvision==0.10.0+cu111
 easydict
 scipy
 scikit-image
@@ -16,3 +18,5 @@ einops
 timm
 tensorboardX
 monai
+h5py
+scikit-learn

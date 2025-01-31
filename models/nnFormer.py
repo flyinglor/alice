@@ -997,8 +997,11 @@ class nnFormer(nn.Module):
     
     
     def mask_model(self, x, mask):
-        _, _, h, w, z = x.size()
+        n, _, h, w, z = x.size()
+        bs = int(n/2)
         mask = nn.functional.interpolate(mask, size=(h, w, z), mode="nearest")
+        if mask.size(0) != x.size(0):
+            mask = mask.repeat_interleave(bs, dim=0)
         x_mask = x * (1 - mask) 
         return x, x_mask
         

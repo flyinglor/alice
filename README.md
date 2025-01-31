@@ -23,11 +23,13 @@ Qualitative visualizations of segmentation results:
 # Installing Dependencies
 Dependencies can be installed using:
 ``` bash
+conda create -n alice python=3.8 cudatoolkit=11.1
+conda activate alice
 pip install -r requirements.txt
 pip install -U openmim
 mim install mmcv==1.4.7
-pip install mmcv-full==1.4.7 -f https://download.openmmlab.com/mmcv/dist/cu102/torch1.9/index.html
-mim install mmdet==2.20
+pip install mmcv-full==1.4.7 -f https://download.openmmlab.com/mmcv/dist/cu111/torch1.9/index.html
+pip install mmdet==2.20
 ```
 
 # Datasets

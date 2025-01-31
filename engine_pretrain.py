@@ -15,7 +15,9 @@ import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 from tqdm import tqdm
 from models.nnFormer import nnFormer
-from interfaces import init_model, get_embedding, find_point_in_vol
+from interfaces import init_model, get_embedding, get_batch_embedding, find_point_in_vol
+from sam.datasets.pipelines import Collect3d
+from sam.datasets.collect import collate
 import pickle
 
 from pathlib import Path
@@ -34,10 +36,12 @@ from torch.multiprocessing import Process
 import torch.utils.data.distributed
 import torch.distributed as dist
 
+import wandb
+
 
 def train_one_epoch(student, teacher, teacher_without_ddp, alice_loss, data_loader,
                     optimizer, lr_schedule, wd_schedule, momentum_schedule, epoch,
-                    fp16_scaler, sam_cfg, CASA, args):
+                    fp16_scaler, sam_cfg, CASA, sam_model, iters, args):
     
     global memory_queue_patch
     device = torch.device(f"cuda:{args.local_rank}")
@@ -58,7 +62,6 @@ def train_one_epoch(student, teacher, teacher_without_ddp, alice_loss, data_load
     params_k = [param_k for name_k, param_k in zip(names_k, params_k) if name_k in names_common]
 
     pred_labels = []
-    iters = 0
     for it, batch in enumerate(metric_logger.log_every(data_loader, 10, header)):
         it = len(data_loader) * epoch + it  # global training iteration
         for i, param_group in enumerate(optimizer.param_groups):
@@ -68,24 +71,53 @@ def train_one_epoch(student, teacher, teacher_without_ddp, alice_loss, data_load
 
         # move images to gpu
         # image = batch['image'].cuda(non_blocking=True)
-        image = batch['image'].to(args.local_rank, non_blocking=True)
-        name1 = batch['name'][0]
+        image = batch['img'].to(args.local_rank, non_blocking=True)
+        # print(type(image)) # <class 'torch.Tensor'>
+        # print(image.shape) # torch.Size([16, 1, 128, 128, 128])
+            # name1 = batch['name'][0]
+        # image_list = list(torch.unbind(image, dim=0))  # Unbind along the batch dimension
+        # collects = Collect3d(keys=['img'], meta_keys=[])
+
+        # # Prepare data for each image in the batch
+        # processed_batch = []
+        # for img in image_list:
+        #     data = {}
+        #     data['img'] = img  # Assign the individual image
+        #     processed_data = collects(data)  # Apply Collect3D
+        #     processed_batch.append(processed_data)  # Store the processed result
+
+        # # Collate the batch
+        # image_batched_data = collate(processed_batch)
+        # print(image_batched_data)
+
         #emb1 = np.load(args.embed_dir+name1+'.npy', allow_pickle=True).item()
-        emb_path_1 = args.embed_dir + 'Embeddings' + name1 + '.pkl'
-        with open(emb_path_1, 'rb') as file:
-            emb1 = pickle.load(file)
-            #print(emb1[0].shape, emb1[1].shape, emb1[2].shape, emb1[3])
+        # emb_path_1 = args.embed_dir + 'Embeddings' + name1 + '.pkl'
+        # with open(emb_path_1, 'rb') as file:
+        #     emb1 = pickle.load(file)
+        #     #print(emb1[0].shape, emb1[1].shape, emb1[2].shape, emb1[3])
         
         if epoch == 0 and iters == 0:
             memory_queue_patch = batch
         
-        memory_image = memory_queue_patch['image']
-        name2 = memory_queue_patch['name'][0]
-        #emb2 = np.load(args.embed_dir+name2+'.npy', allow_pickle=True).item()
-        emb_path_2 = args.embed_dir + 'Embeddings' + name2 + '.pkl'
-        with open(emb_path_2, 'rb') as file_2:
-            emb2 = pickle.load(file_2)
+        memory_image = memory_queue_patch['img']
+        #     name2 = memory_queue_patch['name'][0]
+        # #emb2 = np.load(args.embed_dir+name2+'.npy', allow_pickle=True).item()
+        # emb_path_2 = args.embed_dir + 'Embeddings' + name2 + '.pkl'
+        # with open(emb_path_2, 'rb') as file_2:
+        #     emb2 = pickle.load(file_2)
         
+        # iter_points, scores = 0, 0
+        # while iter_points<=100 and scores<=0.7:
+        #     pts = utils.select_random_points(2, image.transpose(2, 4))
+        #     pts1, pts2 = pts[0], pts[1]
+        #     pts1_pred, scores = find_point_in_vol(emb1, emb2, [pts1], sam_cfg)
+        #     iter_points += 1
+        # pts1_pred = pts1_pred[0]
+
+        #get the embeddings from pretrained sam model
+        emb1 = get_batch_embedding(sam_model, image[0], sam_cfg)
+        emb2 = get_batch_embedding(sam_model, memory_image[0], sam_cfg)
+
         iter_points, scores = 0, 0
         while iter_points<=100 and scores<=0.7:
             pts = utils.select_random_points(2, image.transpose(2, 4))
@@ -93,6 +125,8 @@ def train_one_epoch(student, teacher, teacher_without_ddp, alice_loss, data_load
             pts1_pred, scores = find_point_in_vol(emb1, emb2, [pts1], sam_cfg)
             iter_points += 1
         pts1_pred = pts1_pred[0]
+
+
         query =  utils.crop_tensor_new(image, pts1, args.roi_x, args.roi_y, args.roi_z).to(device)
         anchor = utils.crop_tensor_new(memory_image, pts1_pred, args.roi_x, args.roi_y, args.roi_z).to(device)
         memory_queue_patch = batch
@@ -157,6 +191,18 @@ def train_one_epoch(student, teacher, teacher_without_ddp, alice_loss, data_load
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
         metric_logger.update(wd=optimizer.param_groups[0]["weight_decay"])
         metric_logger.update(acc=acc)
+
+        if not args.disable_wandb:
+            wandb.log(
+                {
+                "lr": optimizer.param_groups[0]['lr'],
+                "train - total loss": loss.item(),
+                "train - recon loss": all_loss.pop('recon').item(),
+                "train - cls loss": all_loss.pop('cls').item(),
+                "train - patch loss": all_loss.pop('patch').item(),
+                },
+                step=iters,
+            )
         
         iters += 1
 
@@ -165,4 +211,4 @@ def train_one_epoch(student, teacher, teacher_without_ddp, alice_loss, data_load
     print("Averaged stats:", metric_logger)
     return_dict = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
     
-    return return_dict
+    return return_dict, iters
