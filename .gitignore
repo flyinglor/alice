@@ -22,7 +22,7 @@ logs/
 
 
 # scripts
-scripts/
+scripts/old_runs/
 
 
 checkpoints_SAM/
